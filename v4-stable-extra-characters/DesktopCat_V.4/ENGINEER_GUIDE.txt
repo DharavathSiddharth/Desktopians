@@ -1,0 +1,795 @@
+================================================================================
+  DESKTOP CAT  —  ENGINEER'S MODIFICATION GUIDE
+  Written for Lucas Sun
+  File: cat_pet.py  (installed at ~/.local/share/desktop-cat/cat_pet.py)
+================================================================================
+
+  This is not a beginner tutorial. This is a working engineer's reference.
+  Every section tells you:
+    1. What the code does and WHY it was written that way
+    2. Exactly what to change and what values are safe
+    3. The C / C++ equivalent — how you would build the same thing in a
+       compiled language (using GTK3/C, SDL2/C++, or raw X11/Wayland)
+
+  Read linearly the first time. After that use it as a lookup table.
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  §1   Architecture Overview
+  §2   The Constants Block — Your Main Control Panel
+  §3   The Animation System (frame accumulator, tick loop)
+  §4   The Movement & Physics System
+  §5   The Behavior State Machine
+  §6   The Drag System (the bug you reported + the fix)
+  §7   The Click-Through Input Region
+  §8   The Layer Shell / Wayland Backend
+  §9   The Drawing System (cairo)
+  §10  The Bubble System (thought bubbles, heart)
+  §11  Adding a New Behavior / State
+  §12  Swapping in New Sprite Art
+  §13  C/C++ Migration Path — Full Roadmap
+  §14  Useful Commands (runtime inspection, debugging)
+
+================================================================================
+  §1  ARCHITECTURE OVERVIEW
+================================================================================
+
+  The app is a single Python class (DesktopCat) that owns:
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  GLib main loop  (event-driven, like a game loop)           │
+    │  └── on_tick()  fires every 33 ms  (TICK_MS)               │
+    │       ├── advances frame_index  (animation)                 │
+    │       ├── moves self.x / self.y  (physics)                  │
+    │       ├── checks bubble expiry                              │
+    │       └── calls _redraw()  → triggers on_draw()            │
+    │                                                             │
+    │  GLib one-shot timers  (behavior decisions)                 │
+    │       └── _schedule_next() → sets state after a delay       │
+    │                                                             │
+    │  GTK signal callbacks  (user input)                         │
+    │       ├── on_button_press  / on_button_release              │
+    │       └── on_motion                                         │
+    └─────────────────────────────────────────────────────────────┘
+
+  In C this would be:
+    - g_timeout_add(33, on_tick, cat_data);   // GLib is the same in C
+    - GtkWidget *window = gtk_window_new(...);
+    - g_signal_connect(window, "draw", G_CALLBACK(on_draw), cat_data);
+    - g_signal_connect(window, "button-press-event", ...);
+
+  In C++ with a game loop (SDL2 / SFML / raw Wayland) you would write:
+    while (running) {
+        uint64_t now = get_time_ms();
+        if (now - last_tick >= TICK_MS) { on_tick(cat); last_tick = now; }
+        handle_events(cat);
+        render(cat);
+    }
+
+  The GLib approach (timer callbacks) is cleaner for a desktop widget because
+  you don't own the main loop — the desktop does. SDL gives you full ownership
+  which is better for games but overkill here.
+
+================================================================================
+  §2  THE CONSTANTS BLOCK  —  YOUR MAIN CONTROL PANEL
+================================================================================
+
+  Location: lines 44–66 of cat_pet.py
+
+  ── TIMING ───────────────────────────────────────────────────────────────────
+
+  TICK_MS = 33
+    Master tick rate in milliseconds. 33ms ≈ 30 fps.
+    Lower = smoother but more CPU. Higher = choppier but lighter.
+    Try: 16 for 60 fps, 50 for 20 fps.
+    In C:  #define TICK_MS 33  then  g_timeout_add(TICK_MS, on_tick, data);
+
+  BUBBLE_H = 46
+    Pixels of space reserved above the cat's body for thought bubbles.
+    Increase this if you want larger speech bubbles.
+    Decrease to 0 to eliminate bubble space entirely.
+
+  ── PHYSICS ──────────────────────────────────────────────────────────────────
+
+  GROUND_MARGIN = 40
+    How many pixels above the bottom of the screen the cat rests.
+    0 = cat sits exactly at the screen edge.
+    80 = cat sits 80px up (useful if you have a taskbar at the bottom).
+    In C:  int ground_y = screen_h - cat_h - GROUND_MARGIN;
+
+  BASE_WALK_SPEED = 2
+    Pixels per tick the cat moves while walking (before multipliers).
+    2 × 30fps = 60 px/sec.  Try 1 (slow crawl) to 5 (brisk march).
+    In C:  cat->x += BASE_WALK_SPEED * cat->direction * cat->speed_mult;
+
+  ALPHA_THRESHOLD = 30
+    Pixels with alpha below this value are treated as transparent for
+    click-through purposes. 0 = only fully transparent pixels pass clicks.
+    255 = the entire bounding box catches clicks (no click-through at all).
+    In C/X11:  XShapeCombineRegion(dpy, win, ShapeInput, 0, 0, region, ...);
+
+  ── SIZES ────────────────────────────────────────────────────────────────────
+
+  SIZES = {"Small": 80, "Medium": 110, "Large": 150}
+    Pixel dimensions (square canvas) for each named size option.
+    Add your own: SIZES = {"Tiny": 55, "Small": 80, "Medium": 110,
+                            "Large": 150, "Huge": 220}
+    The sprites are always scaled to fit; no new art needed.
+    In C:  gdk_pixbuf_scale_simple(src_pb, sz, sz, GDK_INTERP_BILINEAR);
+
+  DEFAULT_SIZE = "Medium"
+    Which size the cat starts at. Change to "Small" or "Large".
+
+  ── ANIMATION SPEEDS ─────────────────────────────────────────────────────────
+
+  SPEEDS = [
+      ("Slow",      280, 0.6),
+      ("Normal",    180, 1.0),
+      ("Fast",      110, 1.6),
+      ("Very Fast",  70, 2.4),
+  ]
+    Each tuple: (menu label, frame_ms, walk_speed_multiplier)
+    frame_ms: milliseconds between sprite frame advances.
+              Lower = faster animation flip. 70ms is about the limit
+              before pixel art looks blurry-fast.
+    walk_speed_multiplier: scales BASE_WALK_SPEED.
+              0.6 × 2 = 1.2 px/tick (slow stroll)
+              2.4 × 2 = 4.8 px/tick (quick trot)
+
+    Add a preset:
+      ("Ludicrous", 40, 4.0),
+    Append it to the list. It automatically appears in the right-click menu.
+
+  DEFAULT_SPEED = 1
+    Index into SPEEDS. 0=Slow, 1=Normal, 2=Fast, 3=Very Fast.
+
+================================================================================
+  §3  THE ANIMATION SYSTEM
+================================================================================
+
+  How it works:
+    self.anim_accum += TICK_MS each physics tick.
+    When anim_accum >= frame_ms, it resets to 0 and frame_index advances by 1.
+    The current frame is:  frames[color][state][frame_index % len(seq)]
+
+  This is a "fixed timestep accumulator" — a standard game programming pattern.
+  It decouples animation speed (frame_ms) from tick rate (TICK_MS) cleanly.
+
+  In C this is:
+    cat->anim_accum += TICK_MS;
+    if (cat->anim_accum >= cat->frame_ms) {
+        cat->anim_accum = 0;
+        cat->frame_index = (cat->frame_index + 1) % frame_count[cat->state];
+    }
+
+  To add a new animation speed slider (continuous, not presets):
+    Replace speed_idx with a raw frame_ms value and bind it to a Gtk.Scale:
+      slider = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 50, 400, 10)
+      slider.set_value(self.frame_ms)
+      slider.connect("value-changed", lambda s: setattr(self, 'frame_ms',
+                                                         int(s.get_value())))
+
+  Frame counts per state (FRAME_COUNTS dict):
+    "idle": 3    — sitting, 3 frames of subtle movement
+    "walk": 4    — side-profile walk cycle, 4 frames
+    "sleep": 3   — curled up, 3 frames
+    "happy": 3   — content expression, 3 frames
+
+  walk_left  = same as walk  (facing left as drawn)
+  walk_right = walk frames mirrored horizontally (free, no extra art needed)
+  fall       = reuses happy[0] (cat looks surprised while airborne)
+
+  To add a new animation state (e.g. "scratch"):
+    1. Add frames: assets/black/scratch_0.png, scratch_1.png  etc.
+    2. Add to FRAME_COUNTS: "scratch": 4
+    3. The _load_sources() and _rebuild_scaled() methods pick it up automatically.
+    4. Add a state transition in the behavior system (see §5).
+    5. No other changes needed — the system is data-driven.
+
+================================================================================
+  §4  THE MOVEMENT & PHYSICS SYSTEM
+================================================================================
+
+  All movement lives in _move_step(), called every tick.
+
+  ── WALKING ──────────────────────────────────────────────────────────────────
+
+  self.x += speed * self.direction
+    direction is +1 (right) or -1 (left).
+    speed = BASE_WALK_SPEED * walk_mult * speed_boost
+    speed_boost is 1.0 normally, set to 3.2 during Zoomies.
+
+  Edge detection:
+    if self.x <= 0:           — hit left wall, flip direction to right
+    if self.x >= screen_w - display_size:  — hit right wall, flip to left
+
+  The cat does NOT currently walk on top of other windows (true shimeji-style).
+  That requires querying the positions of all windows (via XQueryTree on X11,
+  or a compositor extension on Wayland) — significantly more complex.
+
+  In C:
+    cat->x += (int)(BASE_WALK_SPEED * cat->walk_mult * cat->speed_boost
+                    * cat->direction);
+    if (cat->x < 0) { cat->x = 0; cat->direction = 1; }
+    if (cat->x > screen_w - cat->size) { cat->x = screen_w - cat->size;
+                                          cat->direction = -1; }
+
+  ── GRAVITY & FALLING ────────────────────────────────────────────────────────
+
+  When you drop the cat, state = "fall".
+  Each tick:  self.vy += 2   (gravity acceleration, px/tick²)
+              self.y  += self.vy
+
+  When self.y >= ground_y: land, reset vy=0, switch to idle.
+
+  To make gravity stronger:  increase the += 2 to += 4 or more.
+  To add a bounce:
+    When landing: self.vy = -self.vy * 0.5  (50% bounce coefficient)
+                  if abs(self.vy) < 1: self.vy = 0  (stop bouncing)
+
+  In C:
+    cat->vy += GRAVITY;   // GRAVITY = 2 px/tick²
+    cat->y  += cat->vy;
+    if (cat->y >= ground_y) {
+        cat->y = ground_y;
+        cat->vy = 0;
+        set_state(cat, STATE_IDLE);
+    }
+
+  To make the cat fall off the edge of the screen and reappear:
+    Replace the clamp on self.x with wrap-around:
+      if self.x > self.screen_w: self.x = -self.display_size
+      if self.x < -self.display_size: self.x = self.screen_w
+
+================================================================================
+  §5  THE BEHAVIOR STATE MACHINE
+================================================================================
+
+  States: "idle", "walk_left", "walk_right", "sleep", "happy", "fall"
+
+  The machine works via one-shot GLib timers + a behavior_token guard:
+
+    behavior_token is an integer that increments every time a new behavior
+    starts. Every scheduled callback checks that its token still matches.
+    If it doesn't (because something newer happened), the callback just
+    returns False and does nothing. This prevents "ghost timers" from two
+    overlapping behaviors fighting each other.
+
+  In C you'd implement this as:
+    int behavior_token;   // global counter
+    typedef struct { DesktopCat *cat; int token; } TimerData;
+    // In the callback:
+    if (data->token != data->cat->behavior_token) return G_SOURCE_REMOVE;
+
+  State transition diagram:
+
+    idle ──(timer, 3–7s)──► walk_left / walk_right
+         ──(timer, after 3 idles)──► sleep
+         ──(random 12% chance)──► ZOOMIES (fast walk, 1.4s)
+
+    walk ──(timer, 2–5s)──► idle
+
+    sleep ──(timer, 4–9s)──► idle
+
+    idle/walk ──(random 35% during idle scheduling)──► thought bubble "meow"
+
+    any ──(left-click held)──► happy (drag)
+        ──(release)──► fall ──(land)──► idle
+
+    any ──(double-click)──► happy + heart bubble ──(1.2s)──► idle
+
+  To change how often the cat sleeps:
+    In _cb_end_idle():
+      if self.idle_streak >= 3 and random.random() < 0.4:
+    Change 3 to require more idle cycles before sleeping.
+    Change 0.4 to a lower probability (0.2 = 20% chance).
+
+  To make Zoomies more frequent:
+    In _cb_end_idle():
+      elif roll > 0.88:   ← currently 12% chance per idle cycle
+    Change 0.88 to 0.7 for 30% chance, 0.5 for 50%.
+
+  To add a "stretch" behavior (idle cat occasionally stretches):
+    1. Add a "stretch" animation (see §3).
+    2. In _cb_end_idle(), before the walk block:
+         elif roll > 0.75 and roll <= 0.88:
+             self._do_stretch()
+    3. def _do_stretch(self):
+           tok = self.behavior_token
+           self._set_state("stretch")
+           GLib.timeout_add(1500, self._cb_end_stretch, tok)
+       def _cb_end_stretch(self, tok):
+           if tok != self.behavior_token: return False
+           self._set_state("idle")
+           self._schedule_next()
+           return False
+
+  To change thought bubble words:
+    In _cb_random_bubble():
+      random.choice(["meow", "mrrp", "~", "?"])
+    Just edit the list. You can add any short string.
+    Long strings will overflow the bubble; keep it under ~6 characters.
+
+  To change how often bubbles appear:
+    In _schedule_next(), idle branch:
+      if random.random() < 0.35:   ← 35% chance per idle period
+    Lower = rarer bubbles. Set to 0.0 to disable entirely.
+
+================================================================================
+  §6  THE DRAG SYSTEM  —  THE BUG + THE FIX
+================================================================================
+
+  THE BUG (previous version):
+    event.x and event.y are mouse coordinates RELATIVE TO THE WINDOW.
+    When we moved the window, the window shifted under the cursor,
+    so the "relative" coords jumped, making dx/dy huge, sending the cat flying.
+
+  THE FIX (current version):
+    Use event.x_root and event.y_root — these are absolute SCREEN coordinates.
+    They don't change when the window moves. So:
+
+      dx = event.x_root - self._drag_root_x    (stable delta from click point)
+      self.x = self._drag_cat_x + dx           (cat's original pos + delta)
+
+    This is mathematically equivalent to:
+      "cat's new position = where the cat was when you clicked,
+       plus how far the mouse has moved since the click."
+
+  In C/GTK:
+    // On button-press:
+    drag->root_x = event->x_root;
+    drag->root_y = event->y_root;
+    drag->cat_start_x = cat->x;
+    drag->cat_start_y = cat->y;
+
+    // On motion:
+    double dx = event->x_root - drag->root_x;
+    double dy = event->y_root - drag->root_y;
+    cat->x = drag->cat_start_x + dx;
+    cat->y = drag->cat_start_y + dy;
+    apply_position(cat);
+
+  In SDL2/C++:
+    int mouseX, mouseY;
+    SDL_GetMouseState(&mouseX, &mouseY);   // always screen-space
+    cat.x = drag_start_cat_x + (mouseX - drag_start_mouse_x);
+    cat.y = drag_start_cat_y + (mouseY - drag_start_mouse_y);
+
+  This "anchor point + delta" pattern is the universal correct approach for
+  drag-and-drop in ANY framework (web, mobile, desktop). Memorise it.
+
+================================================================================
+  §7  THE CLICK-THROUGH INPUT REGION
+================================================================================
+
+  What it does:
+    Only the pixels of the cat's body catch mouse clicks.
+    The transparent space around the cat passes clicks to whatever is behind.
+    This is what makes the app "non-intrusive" — you can click through it.
+
+  How it works (build_region function):
+    For each row of pixels in the sprite:
+      Scan left-to-right.
+      When you hit an opaque pixel (alpha > ALPHA_THRESHOLD),
+        record a rectangle from that pixel to the next transparent gap.
+    Accumulate all rectangles into a cairo.Region.
+    Apply the region to the window with:
+      window.input_shape_combine_region(region, 0, offset_y)
+
+  In C/X11:
+    // GTK3 exposes XShape via:
+    // gdk_window_shape_combine_region(gdk_win, clip_region, 0, 0);
+    // gdk_window_input_shape_combine_region(gdk_win, input_region, 0, 0);
+    //
+    // Underlying X11 calls (for reference):
+    // XShapeCombineRegion(dpy, xwin, ShapeInput, 0, 0, xregion, ShapeSet);
+
+  In Wayland (native):
+    // wl_surface_set_input_region(surface, region);
+    // struct wl_region *r = wl_compositor_create_region(compositor);
+    // wl_region_add(r, x, y, w, h);  // for each opaque rectangle
+    // wl_surface_set_input_region(surface, r);
+    // wl_region_destroy(r);
+
+  Performance note:
+    build_region() is O(width × height) per frame per sprite.
+    With 110×110 sprites this is ~12,000 iterations — fast enough.
+    If you ever use very large sprites (500px+), precompute regions once
+    at load time (which this code already does: _rebuild_scaled stores them
+    in self.regions so they're not rebuilt every draw call).
+
+  To disable click-through entirely (cat catches ALL clicks):
+    In build_region(), replace the whole function with:
+      region.union(cairo.RectangleInt(0, 0, w, h))
+      return region
+
+================================================================================
+  §8  THE LAYER SHELL / WAYLAND BACKEND
+================================================================================
+
+  The core problem with desktop widgets on Wayland:
+    Wayland deliberately forbids apps from setting their own window position.
+    The compositor (Cosmic) controls window placement; apps just request it.
+    Regular gtk_window_move() calls are silently ignored.
+
+  The solution: wlr-layer-shell protocol
+    A Wayland extension protocol (supported by Cosmic/Smithay, Sway/wlroots,
+    KDE, Mir) that lets special "shell component" windows:
+      - Float above all other windows
+      - Set their own position via margins from screen edges
+      - Receive or ignore keyboard/pointer events explicitly
+
+  How the cat uses it:
+    _init_layer_shell():
+      GtkLayerShell.init_for_window(self)          — opt this window into layer shell
+      GtkLayerShell.set_layer(self, Layer.TOP)     — float above normal windows
+      GtkLayerShell.set_anchor(self, Edge.TOP, True)    — anchor to top edge
+      GtkLayerShell.set_anchor(self, Edge.LEFT, True)   — anchor to left edge
+      GtkLayerShell.set_keyboard_mode(self, NONE)  — never steal keyboard
+
+    _apply_position():
+      GtkLayerShell.set_margin(self, Edge.LEFT, int(self.x))
+      GtkLayerShell.set_margin(self, Edge.TOP,  int(self.y))
+      This moves the cat. Margin from left + top = absolute screen position.
+
+  In C (GTK3 + gtk-layer-shell):
+    #include <gtk-layer-shell.h>
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_layer_init_for_window(GTK_WINDOW(window));
+    gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_TOP);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
+    gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT, cat_x);
+    gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP,  cat_y);
+
+  In C++ (same calls, just wrapped in a class):
+    class DesktopCat {
+        GtkWidget* window;
+        void move(int x, int y) {
+            gtk_layer_set_margin(GTK_WINDOW(window),
+                                 GTK_LAYER_SHELL_EDGE_LEFT, x);
+            gtk_layer_set_margin(GTK_WINDOW(window),
+                                 GTK_LAYER_SHELL_EDGE_TOP,  y);
+        }
+    };
+
+  Fallback for X11 (in _apply_position()):
+    if self.use_layer: GtkLayerShell.set_margin(...)
+    else:              self.move(int(self.x), int(self.y))
+    On X11, gtk_window_move is honoured, so normal move() works fine there.
+
+  Layer choices (change GtkLayerShell.Layer.TOP to):
+    BACKGROUND  — behind wallpaper (cat lives underneath everything)
+    BOTTOM      — above wallpaper, below normal windows
+    TOP         — above normal windows (current)
+    OVERLAY     — above everything including fullscreen (use with care)
+
+================================================================================
+  §9  THE DRAWING SYSTEM (cairo)
+================================================================================
+
+  The cat is drawn in on_draw(), called by GTK whenever the window needs
+  redrawing (which we trigger manually via area.queue_draw()).
+
+  Step 1: Clear to full transparency
+    cr.set_operator(cairo.Operator.CLEAR)
+    cr.paint()
+    This erases any previous frame so the cat doesn't ghost.
+    In C:  cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR); cairo_paint(cr);
+
+  Step 2: Draw the sprite
+    cr.set_operator(cairo.Operator.OVER)
+    Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, BUBBLE_H)
+    cr.paint()
+    OVER composites the sprite over the transparent background correctly.
+    BUBBLE_H offsets the cat down to leave room for thought bubbles above.
+    In C:  gdk_cairo_set_source_pixbuf(cr, pixbuf, 0, BUBBLE_H); cairo_paint(cr);
+
+  Step 3: Draw bubble (if active)
+    Handled in _draw_bubble():
+      Rounded rectangle (via arc segments)  → filled white → stroked black
+      Text centred inside it
+
+  To change the bubble background color:
+    In _draw_bubble():
+      cr.set_source_rgba(1, 1, 1, 0.95)   ← RGBA, 0.0–1.0 each
+    Try (1, 0.95, 0.8, 0.95) for a warm cream tone.
+
+  To change the bubble text color:
+    cr.set_source_rgb(0.1, 0.1, 0.1)   ← near-black
+    Try (0.8, 0.2, 0.2) for red text.
+
+  To change bubble font:
+    cr.select_font_face("Sans", cairo.FontSlant.NORMAL, cairo.FontWeight.BOLD)
+    Replace "Sans" with any installed font name: "Monospace", "Serif", etc.
+    Check installed fonts:  fc-list | grep -i "font name"
+
+  To add a drop-shadow under the cat:
+    In on_draw(), before drawing the sprite:
+      cr.set_source_rgba(0, 0, 0, 0.18)
+      ellipse_rx, ellipse_ry = self.display_size * 0.35, 6
+      cr.save()
+      cx = self.display_size / 2
+      shadow_y = BUBBLE_H + self.display_size - 4
+      cr.translate(cx, shadow_y)
+      cr.scale(ellipse_rx, ellipse_ry)
+      cr.arc(0, 0, 1, 0, 2 * 3.14159)
+      cr.restore()
+      cr.fill()
+
+================================================================================
+  §10  THE BUBBLE SYSTEM
+================================================================================
+
+  Bubbles are stored as  self.bubble = (kind, text)
+  where kind is "text" or "heart".
+  self.bubble_expire is the tick count at which the bubble disappears.
+
+  To show a bubble from anywhere in the code:
+    self._show_bubble("text", "hello!", secs=2.0)
+    self._show_bubble("heart", secs=1.5)
+
+  To add a new bubble kind (e.g. "angry" with red background):
+    In _draw_bubble():
+      if kind == "angry":
+          # draw red rounded rect + text
+          ...
+          return
+    Then call: self._show_bubble("angry", "!!", secs=1.0)
+
+  To make bubbles appear more often while sleeping:
+    In _cb_wake(), before waking:
+      if random.random() < 0.5:
+          self._show_bubble("text", random.choice(["zzz", "...", "*yawn*"]))
+
+  To add a bubble when the cat bounces off a wall:
+    In _move_step(), inside the wall-hit block:
+      if self.x <= 0:
+          self.x = 0; self.direction = 1
+          self._set_state("walk_right")
+          if random.random() < 0.3:
+              self._show_bubble("text", "ow")
+
+================================================================================
+  §11  ADDING A NEW BEHAVIOR / STATE (example: "SCRATCH")
+================================================================================
+
+  Let's say you want: cat occasionally sits and scratches its ear.
+
+  Step 1: Art
+    Add assets/black/scratch_0.png, scratch_1.png, scratch_2.png
+    Add assets/white/scratch_0.png, scratch_1.png, scratch_2.png
+    (200×200 transparent PNGs, centered, baseline-aligned like the others)
+
+  Step 2: Register the frame count
+    FRAME_COUNTS = {"idle": 3, "walk": 4, "sleep": 3, "happy": 3, "scratch": 3}
+    That's it — _load_sources() and _rebuild_scaled() pick it up automatically.
+
+  Step 3: Add the behavior methods
+    def _start_scratch(self):
+        self.behavior_token += 1
+        tok = self.behavior_token
+        self._set_state("scratch")
+        self._show_bubble("text", "~itch~", secs=1.8)
+        GLib.timeout_add(2000, self._cb_end_scratch, tok)
+
+    def _cb_end_scratch(self, tok):
+        if tok != self.behavior_token or self.dragging: return False
+        self._set_state("idle")
+        self._schedule_next()
+        return False
+
+  Step 4: Wire it into the state machine
+    In _cb_end_idle(), add a branch:
+        elif roll > 0.80 and roll <= 0.88:
+            self._start_scratch()
+            return False
+
+  Step 5: Add to the right-click menu (optional)
+    In _menu():
+        simple("Scratch", lambda w: self._start_scratch())
+
+  That is the COMPLETE recipe for any new state. The pattern is always:
+    start function → set_state → GLib.timeout_add → end callback → idle
+
+================================================================================
+  §12  SWAPPING IN NEW SPRITE ART
+================================================================================
+
+  All art lives in:
+    ~/.local/share/desktop-cat/assets/black/
+    ~/.local/share/desktop-cat/assets/white/
+
+  File naming convention (must be exact):
+    idle_0.png  idle_1.png  idle_2.png       (3 frames)
+    walk_0.png  walk_1.png  walk_2.png  walk_3.png   (4 frames)
+    sleep_0.png sleep_1.png sleep_2.png     (3 frames)
+    happy_0.png happy_1.png happy_2.png     (3 frames)
+
+  Requirements:
+    - PNG with true alpha transparency (no baked background)
+    - Any square size — the app scales to DISPLAY_SIZE automatically
+    - Consistent baseline (feet at same vertical position) — prevents jitter
+    - "walk" frames face LEFT — the app auto-mirrors for walk_right
+
+  If you change frame COUNTS (e.g. 6 idle frames instead of 3):
+    Update FRAME_COUNTS["idle"] = 6
+    Add the extra files: idle_3.png idle_4.png idle_5.png
+
+  The sprites are loaded at startup from disk, scaled to DISPLAY_SIZE×DISPLAY_SIZE,
+  and cached in self.frames. The original source is kept in self.src so resizing
+  (via the Size menu) re-scales from the original, not from an already-scaled copy.
+  This prevents quality loss from double-scaling.
+
+  In C, the equivalent pattern is:
+    GdkPixbuf *src[STATE_COUNT][MAX_FRAMES];   // source quality
+    GdkPixbuf *scaled[STATE_COUNT][MAX_FRAMES]; // display-ready
+    // Reload scaled[] when size changes, keep src[] untouched.
+
+================================================================================
+  §13  C / C++ MIGRATION PATH — FULL ROADMAP
+================================================================================
+
+  If you want to rewrite this in C or C++, here is the honest map:
+
+  ── OPTION A: C + GTK3 (closest to current code) ─────────────────────────────
+
+  Libraries needed:
+    libgtk-3-dev        (GTK3 window + drawing)
+    libgdk-pixbuf-2.0   (image loading + scaling)
+    libcairo2-dev       (2D drawing, same API as used here)
+    libgtk-layer-shell  (Wayland positioning)
+
+  Key GTK3 C APIs that map directly from this Python:
+
+    Python                              C
+    ─────────────────────────────────── ─────────────────────────────────────────
+    Gtk.Window()                        gtk_window_new(GTK_WINDOW_TOPLEVEL)
+    win.set_decorated(False)            gtk_window_set_decorated(win, FALSE)
+    win.set_keep_above(True)            gtk_window_set_keep_above(win, TRUE)
+    win.set_app_paintable(True)         gtk_widget_set_app_paintable(win, TRUE)
+    GdkPixbuf.new_from_file(path)       gdk_pixbuf_new_from_file(path, NULL)
+    pixbuf.scale_simple(w,h,interp)     gdk_pixbuf_scale_simple(pb,w,h,interp)
+    pixbuf.flip(True)                   gdk_pixbuf_flip(pb, TRUE)
+    cairo_set_source_pixbuf(...)        gdk_cairo_set_source_pixbuf(cr,pb,x,y)
+    GLib.timeout_add(ms, cb)            g_timeout_add(ms, cb, user_data)
+    cairo.Region()                      cairo_region_create()
+    region.union(RectangleInt(...))     cairo_region_union_rectangle(r, &rect)
+    GtkLayerShell.init_for_window(w)    gtk_layer_init_for_window(GTK_WINDOW(w))
+    GtkLayerShell.set_margin(w,e,v)     gtk_layer_set_margin(GTK_WINDOW(w),e,v)
+    g_signal_connect(w,"draw",cb,data)  same in C
+    Gtk.main()                          gtk_main()
+
+  State machine in C — use an enum:
+    typedef enum { STATE_IDLE, STATE_WALK_LEFT, STATE_WALK_RIGHT,
+                   STATE_SLEEP, STATE_HAPPY, STATE_FALL } CatState;
+    typedef struct {
+        CatState state;
+        int frame_index;
+        int anim_accum;
+        double x, y, vy;
+        int direction;
+        int behavior_token;
+        double speed_boost;
+        gboolean dragging;
+        GdkPixbuf *frames[2][6][8]; // [color][state][frame]
+        cairo_region_t *regions[2][6][8];
+    } DesktopCat;
+
+  Compile command:
+    gcc cat_pet.c -o desktop-cat \
+        $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0) \
+        -Wall -O2
+
+  ── OPTION B: C++ + SDL2 (more game-engine approach) ────────────────────────
+
+  Libraries:
+    libsdl2-dev          (window, events, rendering)
+    libsdl2-image-dev    (PNG loading)
+
+  This is the right choice if you want to build a more game-like pet (particles,
+  shaders, physics, multiple animals interacting). But SDL2 doesn't integrate
+  with the Wayland layer-shell without extra work (you'd use SDL_WINDOW_BORDERLESS
+  + a custom Wayland surface, or a wrapper). For a pure desktop widget, GTK3/C
+  is actually simpler.
+
+  SDL2 sketch:
+    SDL_Window *win = SDL_CreateWindow("",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        cat_size, cat_size,
+        SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_SKIP_TASKBAR);
+    SDL_Texture *frames[STATE_COUNT][MAX_FRAMES];
+    // game loop:
+    while (running) {
+        handle_events(&cat, &drag);
+        update(&cat);      // physics + state machine
+        render(&cat);      // clear → draw sprite → present
+        SDL_Delay(TICK_MS);
+    }
+
+  In SDL2 the drag fix is the same pattern but using SDL_GetGlobalMouseState:
+    int gx, gy;
+    SDL_GetGlobalMouseState(&gx, &gy);   // root screen coords, Wayland-safe
+    cat.x = drag.cat_start_x + (gx - drag.start_x);
+
+  ── OPTION C: Raw Wayland + C (hard mode, maximum control) ──────────────────
+
+  This is what Cosmic's own shell components are written in (in Rust, but
+  the protocol is C-first). You would:
+    1. Connect to the Wayland compositor via wl_display_connect(NULL)
+    2. Get wl_compositor, wl_shm, xdg_wm_base, zwlr_layer_shell_v1
+    3. Create a wl_surface + zwlr_layer_surface_v1 (the cat's window)
+    4. Draw frames into wl_buffer (shared memory via wl_shm_pool)
+    5. Handle wl_seat events (pointer) for drag
+    6. Handle zwlr_layer_surface_v1.configure to acknowledge layout
+
+  This gives you complete control and zero framework overhead.
+  Start here for learning: https://wayland-book.com  (free, excellent)
+
+  ── MY RECOMMENDATION FOR YOU ────────────────────────────────────────────────
+
+  You are an engineer starting out. The progression I'd suggest:
+
+    Phase 1 (now): Modify the Python version using this guide.
+                   You have a working, running program. Learn by tweaking it.
+
+    Phase 2:       Rewrite it in C + GTK3. You'll find the API is nearly
+                   identical — Python here is a thin wrapper over the C library.
+                   Start by porting cat_pet.py function by function.
+                   Compile with gcc and the pkg-config flags above.
+
+    Phase 3:       Replace the GTK drawing with raw cairo on a Wayland surface.
+                   Read wayland-book.com while doing this.
+
+    Phase 4:       Replace GTK entirely. Raw wl_surface + zwlr_layer_shell_v1.
+                   Now you understand what every library was hiding.
+
+    Phase 5:       Write it in Rust using smithay-client-toolkit (what System76
+                   uses for Cosmic components themselves). That's the native path.
+
+================================================================================
+  §14  USEFUL COMMANDS
+================================================================================
+
+  Edit the installed app:
+    nano ~/.local/share/desktop-cat/cat_pet.py
+    # Then re-launch Desktop Cat from the app menu.
+
+  Check if layer-shell is installed:
+    python3 -c "import gi; gi.require_version('GtkLayerShell','0.1'); \
+        from gi.repository import GtkLayerShell; print('OK')"
+
+  List installed fonts for bubble text:
+    fc-list | sort | less
+
+  Watch CPU usage of the running cat:
+    top -p $(pgrep -f cat_pet.py)
+
+  Kill the cat from the terminal:
+    pkill -f cat_pet.py
+
+  Check what Wayland compositor is running:
+    echo $WAYLAND_DISPLAY
+    loginctl show-session $(loginctl | grep $(whoami) | awk '{print $1}') \
+        -p Type
+
+  Inspect GTK window tree (useful for debugging layering issues):
+    GTK_DEBUG=interactive python3 cat_pet.py
+
+  Run with verbose GTK layer-shell logging:
+    GDK_DEBUG=events python3 ~/.local/share/desktop-cat/cat_pet.py 2>&1 | less
+
+  Reinstall after editing:
+    cd ~/Downloads/DesktopCat   # wherever you unzipped
+    ./install.sh
+
+  Check the autostart entry:
+    cat ~/.config/autostart/desktop-cat.desktop
+
+================================================================================
+  END OF GUIDE
+  — Written for Lucas Sun
+  — The cat is yours. Make it do whatever you want.
+================================================================================
